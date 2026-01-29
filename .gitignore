@@ -1,0 +1,24 @@
+# NetSuite
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# OS X
+.DS_Store
+
+# Node
+node_modules/
+npm-debug.log
+
+# SuiteCloud CLI
+/build
+/dist
+suitecloud.config.js
+.suitecloud/
+
+# Sensitive
+.env
