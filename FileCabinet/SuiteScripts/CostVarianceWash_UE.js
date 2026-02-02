@@ -115,20 +115,21 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log'],
                     });
                     const vraLineCount = vraRec.getLineCount({ sublistId: 'item' });
                     for (let v = 0; v < vraLineCount; v++) {
+                        // Use both 'line' (Line ID) and 'lineuniquekey' for robust matching
+                        const vraLineId = vraRec.getSublistValue({ sublistId: 'item', fieldId: 'line', line: v });
                         const vraLineKey = vraRec.getSublistValue({ sublistId: 'item', fieldId: 'lineuniquekey', line: v });
                         const vraRateOnVRA = vraRec.getSublistValue({ sublistId: 'item', fieldId: 'rate', line: v });
-                        if (vraLineKey && vraRateOnVRA !== null && vraRateOnVRA !== '' && typeof vraRateOnVRA !== 'undefined') {
-                            vraRateMapByLineKey[String(vraLineKey)] = Number(vraRateOnVRA);
+
+                        if (vraRateOnVRA !== null && vraRateOnVRA !== '' && typeof vraRateOnVRA !== 'undefined') {
+                            const rateNum = Number(vraRateOnVRA);
+                            if (vraLineId) vraRateMapByLineKey[String(vraLineId)] = rateNum;
+                            if (vraLineKey) vraRateMapByLineKey[String(vraLineKey)] = rateNum;
                         }
                     }
                     log.debug('VRA Rate Map Built', JSON.stringify(vraRateMapByLineKey));
                 } catch (e) {
                     log.error('VRA Load/Map Error', e);
                 }
-
-                // Need to load the record to look at lines safely or use the context newRecord if dynamic enough. 
-                // context.newRecord in afterSubmit is read-only usually, but sufficient for reading lines.
-                // However, standard lines are accessible.
 
                 const lineCount = newRecord.getLineCount({ sublistId: 'item' });
                 const adjLines = []; // Store data to create adjustment later
@@ -138,9 +139,21 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log'],
                     const item = newRecord.getSublistValue({ sublistId: 'item', fieldId: 'item', line: i });
                     const quantity = newRecord.getSublistValue({ sublistId: 'item', fieldId: 'quantity', line: i });
                     const location = newRecord.getSublistValue({ sublistId: 'item', fieldId: 'location', line: i });
-                    // VRA Rate: 直接用 lineuniquekey 對回 Vendor Return Authorization 的 rate。
+
+                    // Match IF line to VRA line using orderline (Source Line ID) or lineuniquekey
+                    const orderLine = newRecord.getSublistValue({ sublistId: 'item', fieldId: 'orderline', line: i });
                     const lineKey = newRecord.getSublistValue({ sublistId: 'item', fieldId: 'lineuniquekey', line: i });
-                    const vraRateRaw = lineKey ? vraRateMapByLineKey[String(lineKey)] : null;
+
+                    log.debug('Line Key Check', `Item: ${item} | OrderLine: ${orderLine} | LineUniqueKey: ${lineKey}`);
+
+                    // Try matching by orderline first (standard), then lineuniquekey
+                    let vraRateRaw = null;
+                    if (orderLine && vraRateMapByLineKey[String(orderLine)] !== undefined) {
+                        vraRateRaw = vraRateMapByLineKey[String(orderLine)];
+                    } else if (lineKey && vraRateMapByLineKey[String(lineKey)] !== undefined) {
+                        vraRateRaw = vraRateMapByLineKey[String(lineKey)];
+                    }
+
                     const vraRate = (vraRateRaw === null || typeof vraRateRaw === 'undefined' || vraRateRaw === '') ? null : Number(vraRateRaw);
 
                     const itemType = newRecord.getSublistValue({ sublistId: 'item', fieldId: 'itemtype', line: i });

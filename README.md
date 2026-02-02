@@ -53,6 +53,19 @@ washUnitCost - currentAvgCost = varianceTotal
 
 因此這張 IA 會把差額**從「調整科目」移回「Inventory Asset」**，並使平均成本在 Group Average 規則下重新滾動。
 
+### 2.3 最簡單的理解方式（白話文版本）
+
+**「把賺到的（或賠掉的）價差，塞回庫存成本裡。」** 
+
+想像你的庫存是一個存錢筒：
+1. **狀況**：你退貨給廠商，廠商退給你的錢（VRA Rate）比你當初買的成本（Avg Cost）還要多，產生了「價差」。
+2. **標準行為**：NetSuite 會把這筆錢放到旁邊的「差異科目口袋」，不放入存錢筒。
+3. **這支程式做的事**：
+   - 它在存錢筒裡執行一個「+1 又 -1」的魔術。
+   - **進來時 (+1)**：帶著「高價（含價差）」進來。
+   - **出去時 (-1)**：帶著「原價（平均成本）」出去。
+   - **結果**：存錢筒裡的硬幣數量沒變（進一出一），但**總金額變多了**（把價差留下來了）。
+
 ---
 
 ## 3. 流程說明（觸發點與資料流）
@@ -65,13 +78,14 @@ washUnitCost - currentAvgCost = varianceTotal
 - **狀態**：Item Fulfillment 必須是 **Shipped**
 - **事件類型**：排除 DELETE
 
-### 3.2 取價（重要：不要用 IF 的 rate）
+### 3.2 取價（重要：精準對應 VRA）
 
-因為 Item Fulfillment 行上的 `rate` 在部分表單/流程下可能為空或不可靠，本客製使用：
+因為 Item Fulfillment 行上的 `rate` 在部分表單/流程下可能為空或不可靠，本客製使用更穩健的策略：
 
 - 讀取 VRA（createdfrom）
-- 以 `lineuniquekey` 將 VRA 行的 `rate` 映射成 `lineKey -> vraRate`
-- 在 IF 逐行處理時，使用同一個 `lineuniquekey` 取回正確的 `vraRate`
+- **優先使用 `orderline` (Line ID)**：這是 NetSuite 標準的單據行連結 ID，最為準確。
+- **備用 `lineuniquekey`**：作為第二層比對機制。
+- 透過上述 ID 將 IF 的每一行精準對應回 VRA，抓取正確的退貨單價 `vraRate`。
 
 ### 3.3 成本與庫存量來源
 
