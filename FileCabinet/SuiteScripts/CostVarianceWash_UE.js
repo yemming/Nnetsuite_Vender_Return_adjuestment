@@ -139,6 +139,7 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log'],
                     const item = newRecord.getSublistValue({ sublistId: 'item', fieldId: 'item', line: i });
                     const quantity = newRecord.getSublistValue({ sublistId: 'item', fieldId: 'quantity', line: i });
                     const location = newRecord.getSublistValue({ sublistId: 'item', fieldId: 'location', line: i });
+                    const unitConversionRate = Number(newRecord.getSublistValue({ sublistId: 'item', fieldId: 'unitconversionrate', line: i })) || 1;
 
                     // Match IF line to VRA line using orderline (Source Line ID) or lineuniquekey
                     const orderLine = newRecord.getSublistValue({ sublistId: 'item', fieldId: 'orderline', line: i });
@@ -166,7 +167,7 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log'],
                         continue;
                     }
 
-                    log.debug('Processing Line', `Item: ${item}, Qty: ${quantity}, VRA Rate: ${vraRate}, Loc: ${location}`);
+                    log.debug('Processing Line', `Item: ${item}, Qty: ${quantity}, VRA Rate: ${vraRate}, Loc: ${location}, UOM Rate: ${unitConversionRate}`);
 
                     // 1. Get Inventory State (Avg Cost & Total Qty)
                     const cacheKey = `${item}|${location}`;
@@ -185,25 +186,21 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log'],
                         continue;
                     }
 
-                    // 2. Calculate Variance
+                    // 2. Calculate Variance (Base Unit)
+                    const assignments = getInventoryAssignmentsFromIF(newRecord, i);
+                    const assignmentTotalQty = assignments.reduce((sum, a) => sum + (Number(a.quantity) || 0), 0);
+                    const baseQty = assignmentTotalQty > 0 ? assignmentTotalQty : (Number(quantity) || 0) * unitConversionRate;
+                    if (baseQty <= 0) {
+                        log.audit('Skipping Item', `Base Qty <= 0 for item ${item}.`);
+                        continue;
+                    }
+
+                    const vraRatePerBase = Number(vraRate) / unitConversionRate;
+
                     // 目標：把 Vendor Return 產生的價差「全部」滾回存貨平均成本。
                     // NetSuite 會用 currentAvgCost 來出庫，供應商退貨金額是 vraRate。
-                    // 我們希望用一張 IA 的「+1 / -1」去調整 Inventory Asset 的總金額 = varianceTotal。
-                    //
-                    // 設：
-                    //   currentAvgCost = 出庫成本（每單位）
-                    //   vraRate        = 退貨金額（每單位）
-                    //   quantity       = 這次退貨數量
-                    //
-                    // 則要滾回庫存的「總差額金額」：
-                    //   varianceTotal = (vraRate - currentAvgCost) * quantity
-                    //
-                    // 後面我們會用一行 +1 @ washUnitCost、一行 -1 @ currentAvgCost
-                    //   Inventory Asset 的變動 = washUnitCost - currentAvgCost
-                    // 要讓這個變動剛好等於 varianceTotal，因此：
-                    //   washUnitCost - currentAvgCost = varianceTotal
-                    //   washUnitCost = currentAvgCost + varianceTotal
-                    const varianceTotal = (vraRate - currentAvgCost) * quantity;
+                    // Advanced Inventory/UOM：用 Base Unit 計算。
+                    const varianceTotal = (vraRatePerBase - currentAvgCost) * baseQty;
 
                     if (Math.abs(varianceTotal) < 0.01) {
                         log.debug('Skipping Item', 'Variance is negligible.');
@@ -211,18 +208,17 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log'],
                     }
 
                     // 3. Calculate Wash Unit Cost
-                    // 如上推導，單一「虛擬 +1 / -1」的 IA，只要讓：
-                    //   washUnitCost = currentAvgCost + varianceTotal
-                    // 即可讓 Inventory Asset 的總金額多 / 少 = varianceTotal，
-                    // 進而讓 Group Average 重新計算到正確的平均成本。
-                    const washUnitCost = Number(currentAvgCost) + Number(varianceTotal);
+                    // 用 Base Unit 的 VRA 單價，配合 +baseQty / -baseQty
+                    const washUnitCost = Number(vraRatePerBase);
 
-                    log.debug('Calculation', `AvgCost: ${currentAvgCost}, VRA Rate: ${vraRate}, VarTotal: ${varianceTotal}, TotalQty: ${totalQtyOnHand}, WashCost: ${washUnitCost}`);
+                    log.debug('Calculation', `AvgCost: ${currentAvgCost}, VRA Rate(Base): ${vraRatePerBase}, VarTotal: ${varianceTotal}, BaseQty: ${baseQty}, TotalQty: ${totalQtyOnHand}, WashCost: ${washUnitCost}`);
 
                     adjLines.push({
                         item: item,
                         washCost: washUnitCost,
-                        location: p_dummy_location
+                        location: location || p_dummy_location,
+                        assignments: assignments,
+                        adjustQty: baseQty
                     });
 
                 }
@@ -283,64 +279,218 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log'],
         }
 
         /**
-         * Create the Inventory Adjustment record.
-         * @param {Array} lines 
-         * @param {string} accountId 
-         * @param {string} ifId 
-         * @param {string} dummyLocationId
-         * @param {string} subsidiaryId
+         * 使用 N/record 建立 Inventory Adjustment，純 SuiteScript 不呼叫外部 API。
+         * 每個品項寫兩行：+1 @ washCost（入庫）、-1（出庫，系統以平均成本扣減）。
+         * Advanced Inventory 情境下，會嘗試把 IF 的 inventorydetail 帶進 IA。
+         * @param {Array} lines - [{ item, washCost, location, assignments }]
+         * @param {string} accountId - 調整科目
+         * @param {string} ifId - Item Fulfillment ID（寫入 memo）
+         * @param {string} dummyLocationId - 虛擬倉（與 Script Parameter 一致）
+         * @param {string} subsidiaryId - 子公司
          */
         const createInventoryAdjustment = (lines, accountId, ifId, dummyLocationId, subsidiaryId) => {
-            const adjRec = record.create({
-                type: record.Type.INVENTORY_ADJUSTMENT,
-                isDynamic: false
-            });
+            try {
+                // dynamic 模式才有 selectNewLine / setCurrentSublistValue / commitLine
+                const adjRec = record.create({
+                    type: record.Type.INVENTORY_ADJUSTMENT,
+                    isDynamic: true
+                });
 
-            adjRec.setValue({ fieldId: 'subsidiary', value: subsidiaryId }); // Set Subsidiary FIRST
-            adjRec.setValue({ fieldId: 'account', value: accountId });
-            adjRec.setValue({ fieldId: 'memo', value: `${MEMO_PREFIX}${ifId}` });
-            // Depending on environment, might need to set subsidiary first.
+                // IA 表頭順序：Subsidiary -> Adjustment Account
+                adjRec.setValue({ fieldId: 'subsidiary', value: subsidiaryId });
+                adjRec.setValue({ fieldId: 'account', value: accountId });
+                adjRec.setValue({ fieldId: 'tranDate', value: new Date() });
+                adjRec.setValue({ fieldId: 'memo', value: `${MEMO_PREFIX}${ifId}` });
 
-            lines.forEach((lineData, i) => {
-                const lineIndexIn = i * 2;
-                const lineIndexOut = i * 2 + 1;
+                lines.forEach((lineData) => {
+                    const effectiveLocation = lineData.location || dummyLocationId;
+                    const adjustQty = Number(lineData.adjustQty) || 1;
 
-                // Line 1 (In): Qty +1, Cost = washCost
-                adjRec.setSublistValue({ sublistId: 'inventory', fieldId: 'item', line: lineIndexIn, value: lineData.item });
-                adjRec.setSublistValue({ sublistId: 'inventory', fieldId: 'location', line: lineIndexIn, value: dummyLocationId });
-                adjRec.setSublistValue({ sublistId: 'inventory', fieldId: 'adjustqtyby', line: lineIndexIn, value: 1 });
-                adjRec.setSublistValue({ sublistId: 'inventory', fieldId: 'unitcost', line: lineIndexIn, value: lineData.washCost });
+                    // ============================================================
+                    // Advanced Inventory 環境下，IA 欄位設定順序至關重要！
+                    // 正確順序：item → location → adjustqtyby → inventorydetail → unitcost → commitLine
+                    // 
+                    // ★★★ 關鍵發現 ★★★
+                    // inventory detail 的 assignment quantity 必須等於 adjustqtyby！
+                    // 如果 adjustqtyby = 10，inventory assignment 也必須是 qty=10。
+                    // 不能複製 IF 的原始 assignments（可能是多個 qty=1 的行）。
+                    // ============================================================
 
-                // Configure Inventory Detail - best effort
-                // 這裡不再硬塞 inventorystatus，由系統帶預設狀態，只補上數量即可。
-                try {
-                    const subrecIn = adjRec.getSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail', line: lineIndexIn });
-                    if (subrecIn) {
-                        subrecIn.setSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', line: 0, value: 1 });
-                    }
-                } catch (e) {
-                    log.audit('Inventory Detail Skipped', `LineIn inventorydetail not set. Item ${lineData.item}. Reason: ${e}`);
+                    // 從 IF 取得第一個 assignment 的 inventory status（如果有的話）
+                    const firstAssignment = lineData.assignments && lineData.assignments.length > 0 
+                        ? lineData.assignments[0] 
+                        : null;
+                    const inventoryStatusId = firstAssignment ? firstAssignment.inventoryStatusId : null;
+
+                    log.debug('IA Line Prep', `Item: ${lineData.item}, AdjQty: ${adjustQty}, Status: ${inventoryStatusId}`);
+
+                    // 行一：+adjustQty 入庫 @ washCost
+                    adjRec.selectNewLine({ sublistId: 'inventory' });
+                    adjRec.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: lineData.item });
+                    adjRec.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'location', value: effectiveLocation });
+                    adjRec.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'adjustqtyby', value: adjustQty });
+                    
+                    // ★ 處理 inventory detail：創建單一 assignment，quantity = adjustQty
+                    applyInventoryDetailForAdjustment(adjRec, adjustQty, inventoryStatusId, 'in');
+                    
+                    adjRec.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'unitcost', value: lineData.washCost });
+                    adjRec.commitLine({ sublistId: 'inventory' });
+
+                    // 行二：-adjustQty 出庫（不設 unitcost，由系統以該地點平均成本扣減）
+                    adjRec.selectNewLine({ sublistId: 'inventory' });
+                    adjRec.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'item', value: lineData.item });
+                    adjRec.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'location', value: effectiveLocation });
+                    adjRec.setCurrentSublistValue({ sublistId: 'inventory', fieldId: 'adjustqtyby', value: -adjustQty });
+                    
+                    // ★ 處理 inventory detail：創建單一 assignment，quantity = adjustQty
+                    applyInventoryDetailForAdjustment(adjRec, adjustQty, inventoryStatusId, 'out');
+                    
+                    // 出庫不設 unitcost，讓系統自動用平均成本
+                    adjRec.commitLine({ sublistId: 'inventory' });
+                });
+
+                const adjId = adjRec.save();
+                log.audit('Adjustment Created', `ID: ${adjId} for IF: ${ifId}`);
+            } catch (e) {
+                log.error('Create Inventory Adjustment Failed', e.toString());
+            }
+        }
+
+        /**
+         * 從 Item Fulfillment 讀取 inventorydetail（Advanced Inventory）。
+         * @param {Record} ifRec
+         * @param {number} lineIndex
+         * @returns {Array} [{ quantity, inventoryNumberId, binNumberId, inventoryStatusId }]
+         */
+        const getInventoryAssignmentsFromIF = (ifRec, lineIndex) => {
+            try {
+                const subrec = ifRec.getSublistSubrecord({
+                    sublistId: 'item',
+                    fieldId: 'inventorydetail',
+                    line: lineIndex
+                });
+                if (!subrec) return [];
+
+                const assignmentCount = subrec.getLineCount({ sublistId: 'inventoryassignment' });
+                if (!assignmentCount) return [];
+
+                const assignments = [];
+                for (let a = 0; a < assignmentCount; a++) {
+                    const quantity = subrec.getSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', line: a });
+                    const binNumberId = subrec.getSublistValue({ sublistId: 'inventoryassignment', fieldId: 'binnumber', line: a });
+                    const issueInvId = subrec.getSublistValue({ sublistId: 'inventoryassignment', fieldId: 'issueinventorynumber', line: a });
+                    const receiptInvId = subrec.getSublistValue({ sublistId: 'inventoryassignment', fieldId: 'receiptinventorynumber', line: a });
+                    const inventoryStatusId = subrec.getSublistValue({ sublistId: 'inventoryassignment', fieldId: 'inventorystatus', line: a });
+
+                    assignments.push({
+                        quantity: Number(quantity) || 0,
+                        inventoryNumberId: issueInvId || receiptInvId || null,
+                        binNumberId: binNumberId || null,
+                        inventoryStatusId: inventoryStatusId || null
+                    });
                 }
 
-                // Line 2 (Out): Qty -1, Cost = Auto
-                adjRec.setSublistValue({ sublistId: 'inventory', fieldId: 'item', line: lineIndexOut, value: lineData.item });
-                adjRec.setSublistValue({ sublistId: 'inventory', fieldId: 'location', line: lineIndexOut, value: dummyLocationId });
-                adjRec.setSublistValue({ sublistId: 'inventory', fieldId: 'adjustqtyby', line: lineIndexOut, value: -1 });
+                return assignments;
+            } catch (e) {
+                log.debug('InventoryDetail Read Skip', e.toString());
+                return [];
+            }
+        }
 
-                // Configure Inventory Detail - best effort
-                try {
-                    const subrecOut = adjRec.getSublistSubrecord({ sublistId: 'inventory', fieldId: 'inventorydetail', line: lineIndexOut });
-                    if (subrecOut) {
-                        // assignment 的 quantity 需與調整方向一致
-                        subrecOut.setSublistValue({ sublistId: 'inventoryassignment', fieldId: 'quantity', line: 0, value: -1 });
-                    }
-                } catch (e) {
-                    log.audit('Inventory Detail Skipped', `LineOut inventorydetail not set. Item ${lineData.item}. Reason: ${e}`);
+        /**
+         * 為 IA 當前列設定 inventory detail（簡化版，專為 Inventory Status 設計）。
+         * 
+         * ★★★ 關鍵 ★★★
+         * inventory assignment 的 quantity 必須等於 adjustqtyby！
+         * 這是 NetSuite Advanced Inventory 的硬性要求。
+         * 
+         * 此函數必須在設定 adjustqtyby 之後、設定 unitcost 之前呼叫！
+         * 
+         * @param {Record} adjRec - Inventory Adjustment record (dynamic mode)
+         * @param {number} adjustQty - 調整數量（必須與 adjustqtyby 一致）
+         * @param {string|number|null} inventoryStatusId - Inventory Status ID（如果使用）
+         * @param {'in'|'out'} direction - 'in' 用於入庫，'out' 用於出庫
+         */
+        const applyInventoryDetailForAdjustment = (adjRec, adjustQty, inventoryStatusId, direction) => {
+            try {
+                const invDetail = adjRec.getCurrentSublistSubrecord({
+                    sublistId: 'inventory',
+                    fieldId: 'inventorydetail'
+                });
+                
+                if (!invDetail) {
+                    log.debug('InventoryDetail Skip', 'No inventorydetail subrecord (item may not require it)');
+                    return;
                 }
-            });
 
-            const adjId = adjRec.save();
-            log.audit('Adjustment Created', `ID: ${adjId} for IF: ${ifId}`);
+                // ★★★ 關鍵修正 ★★★
+                // 入庫（in）: quantity 必須是正數
+                // 出庫（out）: quantity 必須是負數
+                const effectiveQty = direction === 'out' ? -Math.abs(adjustQty) : Math.abs(adjustQty);
+
+                // 檢查是否已經有系統自動建立的行
+                const existingLineCount = invDetail.getLineCount({ sublistId: 'inventoryassignment' });
+                log.debug('InventoryDetail Check', `Direction: ${direction}, ExistingLines: ${existingLineCount}, EffectiveQty: ${effectiveQty}, Status: ${inventoryStatusId}`);
+
+                if (existingLineCount > 0) {
+                    // ★ NetSuite 可能已經自動建立了 assignment 行
+                    // 我們需要編輯第一行，而不是新增
+                    invDetail.selectLine({ sublistId: 'inventoryassignment', line: 0 });
+                    
+                    // 設定 Inventory Status（如果有）
+                    if (inventoryStatusId) {
+                        invDetail.setCurrentSublistValue({
+                            sublistId: 'inventoryassignment',
+                            fieldId: 'inventorystatus',
+                            value: inventoryStatusId
+                        });
+                    }
+                    
+                    // ★ 關鍵：設定 quantity（入庫正數，出庫負數）
+                    invDetail.setCurrentSublistValue({
+                        sublistId: 'inventoryassignment',
+                        fieldId: 'quantity',
+                        value: effectiveQty
+                    });
+                    
+                    invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                    log.debug('InventoryDetail Updated', `Edited line 0: qty=${effectiveQty}, status=${inventoryStatusId}`);
+                } else {
+                    // 沒有現有行，新增一行
+                    invDetail.selectNewLine({ sublistId: 'inventoryassignment' });
+                    
+                    // 設定 Inventory Status（如果有）
+                    if (inventoryStatusId) {
+                        invDetail.setCurrentSublistValue({
+                            sublistId: 'inventoryassignment',
+                            fieldId: 'inventorystatus',
+                            value: inventoryStatusId
+                        });
+                    }
+                    
+                    // ★ 關鍵：設定 quantity（入庫正數，出庫負數）
+                    invDetail.setCurrentSublistValue({
+                        sublistId: 'inventoryassignment',
+                        fieldId: 'quantity',
+                        value: effectiveQty
+                    });
+                    
+                    invDetail.commitLine({ sublistId: 'inventoryassignment' });
+                    log.debug('InventoryDetail Created', `New line: qty=${effectiveQty}, status=${inventoryStatusId}`);
+                }
+            } catch (e) {
+                // 記錄錯誤但不中斷流程
+                log.error('InventoryDetail Failed', `Direction: ${direction}, Error: ${e.toString()}`);
+            }
+        }
+
+        /**
+         * 【已棄用】原始的 inventory detail 處理函數
+         * 保留以供參考，但不再使用
+         */
+        const applyInventoryDetailToCurrentLine = (adjRec, assignments, direction) => {
+            // 此函數已被 applyInventoryDetailForAdjustment 取代
+            log.debug('Deprecated', 'applyInventoryDetailToCurrentLine is deprecated');
         }
 
         /**
@@ -368,6 +518,7 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log'],
                 return false;
             }
         }
+
 
         return {
             afterSubmit: afterSubmit
