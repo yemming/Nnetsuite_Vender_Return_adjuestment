@@ -122,3 +122,20 @@ IA 的兩行會讓 Inventory Asset 的淨變動等於（washUnitCost - currentAv
 驗收不要搞太複雜，用最小案例：平均成本 9.225、退貨價 10，跑完看 IA 分錄跟平均成本是否移動。  
 如果這兩個過了，代表核心邏輯是穩的，之後才擴到更多品項與情境。
 
+---
+
+## 附錄｜NetSuite IA 必填欄位與 Inventory Status（開發參考）
+
+**依據 NetSuite / Oracle 官方文件與 SuiteScript Record Browser：**
+
+- **Inventory Adjustment 記錄層必填**：`account`、`customform`、`subsidiary`、`trandate`；OneWorld 需 `subsidiary`。
+- **inventory 子清單（每一行）必填**：`item`、`location`、`adjustqtyby`。
+- **Inventory Status 必填位置**：當帳戶啟用 Inventory Status 時，「Status」是 **Inventory Detail 彈出視窗** 裡的必填欄位；在 SuiteScript 裡對應的是 **inventorydetail 子記錄 > inventoryassignment 子清單** 的欄位 **`inventorystatus`**（Required: true）。  
+  **注意**：IA 的 **inventory 子清單本身沒有 `inventorystatus` 欄位**（見 Record Browser inventoryadjustment），若對該子清單設 `inventorystatus` 會出現 *"Invalid Field Value X for the following field: inventorystatus"*。Status 只能設在 **inventorydetail > inventoryassignment** 那一層。
+- **型別注意**：`setSublistValue` 對 **Select 欄位**（含 `inventorystatus`）須傳 **字串**（internal ID 的 string），寫法：`value: String(statusId)`。
+- **跨環境**：每個帳戶的 Inventory Status internal ID 不同（A 帳 Good=1、B 帳 Good=2 皆可能）。腳本必須依「目前帳戶」查詢 `inventorystatus` 取得 ID，**不可硬編碼 1**，否則換環境會出現 *"Invalid Field Value 1 for the following field: inventorystatus"*。找不到有效狀態時會中止建立 IA 並寫入日誌。
+- **參考**：  
+  - [Entering Inventory Details on Transactions or Records](https://docs.oracle.com/en/cloud/saas/netsuite/ns-online-help/section_0326021504.html)  
+  - [SuiteScript Record Browser: inventorydetail](https://system.netsuite.com/help/helpcenter/en_US/srbrowser/Browser2025_2/script/record/inventorydetail.html)（inventoryassignment 子清單欄位定義）  
+  - N/record：Text、Radio、**Select 欄位接受 string 值**
+

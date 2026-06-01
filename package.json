@@ -1,0 +1,27 @@
+{
+  "name": "nnetsuite_vender_return_adjuestment",
+  "version": "1.0.0",
+  "description": "> 兄弟版本：這份文件是交付客戶用的「可落地說明」，讓財會/倉儲/系統三方對同一件事講同一句話：   > **供應商退貨（Vendor Return）產生的價差，不要留在差異科目，而是要回滾到存貨平均成本（Group Average）裡。**",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yemming/Nnetsuite_Vender_Return_adjuestment.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/yemming/Nnetsuite_Vender_Return_adjuestment/issues"
+  },
+  "homepage": "https://github.com/yemming/Nnetsuite_Vender_Return_adjuestment#readme",
+  "devDependencies": {
+    "oauth-1.0a": "^2.2.6"
+  }
+}

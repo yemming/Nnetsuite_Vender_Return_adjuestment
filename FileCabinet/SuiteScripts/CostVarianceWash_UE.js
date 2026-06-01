@@ -197,10 +197,34 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log'],
 
                     const vraRatePerBase = Number(vraRate) / unitConversionRate;
 
-                    // 目標：把 Vendor Return 產生的價差「全部」滾回存貨平均成本。
-                    // NetSuite 會用 currentAvgCost 來出庫，供應商退貨金額是 vraRate。
-                    // Advanced Inventory/UOM：用 Base Unit 計算。
-                    const varianceTotal = (vraRatePerBase - currentAvgCost) * baseQty;
+                    // ============================================================
+                    // 正確的價差計算邏輯：
+                    // 
+                    // 場景：10 顆 @ 100 元 = 1000 元，退 1 顆只拿回 50 元
+                    // 期望：9 顆 @ 105.55 = 950 元（把差異滾回平均成本）
+                    // 
+                    // NetSuite 原生行為：
+                    //   - 退貨用平均成本 100 元出庫 → 存貨變 900 元
+                    //   - 50 元差異進入 Vendor Return Variance
+                    // 
+                    // 我們要做的：
+                    //   - 用 IA 把 50 元差異「加回」存貨
+                    //   - 讓存貨從 900 → 950 元
+                    // 
+                    // IA 的做法（+1 / -1）：
+                    //   +1 @ washUnitCost
+                    //   -1 @ currentAvgCost（系統自動用平均成本出庫）
+                    //   淨效果 = washUnitCost - currentAvgCost
+                    // 
+                    // 我們要讓淨效果 = 價差（每單位）× 數量
+                    //   價差 = currentAvgCost - vraRatePerBase = 100 - 50 = 50
+                    //   washUnitCost = currentAvgCost + 價差 = 100 + 50 = 150
+                    // 
+                    // 驗證：+1 @ 150，-1 @ 100 → 淨效果 +50 ✓
+                    // ============================================================
+                    
+                    const variancePerUnit = currentAvgCost - vraRatePerBase;  // 每單位價差（正數代表虧損）
+                    const varianceTotal = variancePerUnit * baseQty;          // 總價差金額
 
                     if (Math.abs(varianceTotal) < 0.01) {
                         log.debug('Skipping Item', 'Variance is negligible.');
@@ -208,10 +232,11 @@ define(['N/record', 'N/search', 'N/runtime', 'N/log'],
                     }
 
                     // 3. Calculate Wash Unit Cost
-                    // 用 Base Unit 的 VRA 單價，配合 +baseQty / -baseQty
-                    const washUnitCost = Number(vraRatePerBase);
+                    // washUnitCost = currentAvgCost + 價差
+                    // 這樣 IA 的淨效果 = washUnitCost - currentAvgCost = 價差
+                    const washUnitCost = currentAvgCost + variancePerUnit;
 
-                    log.debug('Calculation', `AvgCost: ${currentAvgCost}, VRA Rate(Base): ${vraRatePerBase}, VarTotal: ${varianceTotal}, BaseQty: ${baseQty}, TotalQty: ${totalQtyOnHand}, WashCost: ${washUnitCost}`);
+                    log.debug('Calculation', `AvgCost: ${currentAvgCost}, VRA Rate(Base): ${vraRatePerBase}, VariancePerUnit: ${variancePerUnit}, VarTotal: ${varianceTotal}, BaseQty: ${baseQty}, TotalQty: ${totalQtyOnHand}, WashCost: ${washUnitCost}`);
 
                     adjLines.push({
                         item: item,
